@@ -13,7 +13,9 @@ TARGET_USERNAME = "neobrother"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+MY_BALANCE = float(os.environ.get("MY_BALANCE", "0"))
 
+POSITIONS_URL = "https://data-api.polymarket.com/positions"
 STATE_FILE = "last_seen.json"
 POLL_LIMIT = 50
 
@@ -50,6 +52,15 @@ def fetch_all_activity(since_ts: int) -> list[dict]:
     return new_trades
 
 
+def fetch_portfolio_value(wallet: str) -> float:
+    params = urllib.parse.urlencode({"user": wallet, "limit": 500})
+    url = f"{POSITIONS_URL}?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "polymarket-alerts/1.0"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        positions = json.loads(resp.read().decode())
+    return sum(float(p.get("currentValue", 0)) for p in positions)
+
+
 def matches_allowed_city(trade: dict) -> bool:
     title = trade.get("title", "").lower()
     slug = trade.get("eventSlug", "").lower()
@@ -61,7 +72,7 @@ def clean_title(title: str) -> str:
     return title.replace("Â°", "°").replace("Â°", "°")
 
 
-def format_trade(trade: dict) -> str:
+def format_trade(trade: dict, target_portfolio: float) -> str:
     ts = trade.get("timestamp", 0)
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     title = clean_title(trade.get("title", "Unknown Market"))
@@ -79,8 +90,14 @@ def format_trade(trade: dict) -> str:
         f"{direction_emoji} *{side} {outcome}*",
         f"Market: {title}",
         f"Price: {price:.3f} | Shares: {size:.2f} | Cost: ${usdc:.2f}",
-        f"Time: {dt}",
     ]
+
+    if target_portfolio > 0 and MY_BALANCE > 0:
+        pct = (usdc / target_portfolio) * 100 if target_portfolio else 0
+        suggested = (usdc / target_portfolio) * MY_BALANCE if target_portfolio else 0
+        lines.append(f"Weight: {pct:.1f}% of portfolio -> *Suggested: ${suggested:.2f}*")
+
+    lines.append(f"Time: {dt}")
     if market_url:
         lines.append(f"[View Market]({market_url})")
 
@@ -151,6 +168,9 @@ def main():
         print(f"Updated last_seen timestamp to {max_ts}")
         return
 
+    target_portfolio = fetch_portfolio_value(TARGET_WALLET)
+    print(f"@{TARGET_USERNAME} portfolio value: ${target_portfolio:.2f}, My balance: ${MY_BALANCE:.2f}")
+
     batched = batch_trades(trades)
 
     for trade in batched:
@@ -158,7 +178,7 @@ def main():
         header = f"*@{TARGET_USERNAME}* new trade"
         if batch_count:
             header = f"*@{TARGET_USERNAME}* {batch_count} trades (batched)"
-        msg = f"{header}\n\n{format_trade(trade)}"
+        msg = f"{header}\n\n{format_trade(trade, target_portfolio)}"
         print(f"Sending alert: {trade.get('title')} {trade.get('side')}")
         send_telegram(msg)
         time.sleep(0.5)
