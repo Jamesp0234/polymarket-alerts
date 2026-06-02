@@ -187,5 +187,20 @@ def main():
     print(f"Updated last_seen timestamp to {max_ts}")
 
 
+def send_balance_reminder():
+    msg = (
+        "*Daily Reminder*\n\n"
+        f"Your current configured balance is *${MY_BALANCE:.2f}*.\n"
+        "If this has changed, update the `MY_BALANCE` secret:\n"
+        "github.com/Jamesp0234/polymarket-alerts/settings/secrets/actions"
+    )
+    send_telegram(msg)
+    print("Sent daily balance reminder")
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--remind":
+        send_balance_reminder()
+    else:
+        main()
