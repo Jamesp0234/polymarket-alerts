@@ -17,6 +17,8 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 STATE_FILE = "last_seen.json"
 POLL_LIMIT = 50
 
+ALLOWED_CITIES = ["miami", "nyc", "chicago", "san francisco"]
+
 
 def load_state() -> int:
     if os.path.exists(STATE_FILE):
@@ -30,7 +32,7 @@ def save_state(ts: int):
         json.dump({"last_timestamp": ts}, f)
 
 
-def fetch_activity(since_ts: int) -> list[dict]:
+def fetch_all_activity(since_ts: int) -> list[dict]:
     params = urllib.parse.urlencode({
         "user": TARGET_WALLET,
         "limit": POLL_LIMIT,
@@ -46,6 +48,13 @@ def fetch_activity(since_ts: int) -> list[dict]:
     new_trades = [t for t in trades if t.get("timestamp", 0) > since_ts]
     new_trades.sort(key=lambda t: t["timestamp"])
     return new_trades
+
+
+def matches_allowed_city(trade: dict) -> bool:
+    title = trade.get("title", "").lower()
+    slug = trade.get("eventSlug", "").lower()
+    text = f"{title} {slug}"
+    return any(city in text for city in ALLOWED_CITIES)
 
 
 def clean_title(title: str) -> str:
@@ -126,16 +135,23 @@ def main():
     last_ts = load_state()
     print(f"Checking trades for @{TARGET_USERNAME} since timestamp {last_ts}")
 
-    trades = fetch_activity(last_ts)
+    all_trades = fetch_all_activity(last_ts)
 
-    if not trades:
+    if not all_trades:
         print("No new trades found.")
         return
 
-    print(f"Found {len(trades)} new trade(s)")
+    max_ts = max(t.get("timestamp", 0) for t in all_trades)
+
+    trades = [t for t in all_trades if matches_allowed_city(t)]
+    print(f"Found {len(all_trades)} new trade(s), {len(trades)} in allowed cities")
+
+    if not trades:
+        save_state(max_ts)
+        print(f"Updated last_seen timestamp to {max_ts}")
+        return
 
     batched = batch_trades(trades)
-    max_ts = max(t.get("timestamp", 0) for t in trades)
 
     for trade in batched:
         batch_count = trade.pop("_batch_count", None)
