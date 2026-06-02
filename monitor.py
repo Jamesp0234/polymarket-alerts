@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import time
 import urllib.request
 import urllib.parse
@@ -13,8 +14,9 @@ TARGET_USERNAME = "neobrother"
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-MY_BALANCE = float(os.environ.get("MY_BALANCE", "0"))
+INITIAL_BALANCE = float(os.environ.get("MY_BALANCE", "0"))
 
+TELEGRAM_UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
 POSITIONS_URL = "https://data-api.polymarket.com/positions"
 STATE_FILE = "last_seen.json"
 POLL_LIMIT = 50
@@ -22,16 +24,16 @@ POLL_LIMIT = 50
 ALLOWED_CITIES = ["miami", "nyc", "chicago", "san francisco"]
 
 
-def load_state() -> int:
+def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
-            return json.load(f).get("last_timestamp", 0)
-    return 0
+            return json.load(f)
+    return {}
 
 
-def save_state(ts: int):
+def save_state(state: dict):
     with open(STATE_FILE, "w") as f:
-        json.dump({"last_timestamp": ts}, f)
+        json.dump(state, f)
 
 
 def fetch_all_activity(since_ts: int) -> list[dict]:
@@ -61,6 +63,37 @@ def fetch_portfolio_value(wallet: str) -> float:
     return sum(float(p.get("currentValue", 0)) for p in positions)
 
 
+def check_telegram_balance_updates(state: dict) -> float | None:
+    last_update_id = state.get("last_update_id", 0)
+    params = urllib.parse.urlencode({"offset": last_update_id + 1, "timeout": 0})
+    url = TELEGRAM_UPDATES_URL.format(token=TELEGRAM_BOT_TOKEN) + f"?{params}"
+    req = urllib.request.Request(url, headers={"User-Agent": "polymarket-alerts/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode())
+
+    if not data.get("ok") or not data.get("result"):
+        return None
+
+    new_balance = None
+    for update in data["result"]:
+        state["last_update_id"] = update["update_id"]
+        msg = update.get("message", {})
+        if str(msg.get("chat", {}).get("id")) != TELEGRAM_CHAT_ID:
+            continue
+        text = msg.get("text", "").strip()
+        # Accept plain numbers or "balance 220" format
+        text = re.sub(r"(?i)^balance\s+", "", text)
+        text = text.replace("$", "").replace(",", "")
+        try:
+            val = float(text)
+            if 0 <= val <= 1_000_000:
+                new_balance = val
+        except ValueError:
+            pass
+
+    return new_balance
+
+
 def matches_allowed_city(trade: dict) -> bool:
     title = trade.get("title", "").lower()
     slug = trade.get("eventSlug", "").lower()
@@ -72,7 +105,7 @@ def clean_title(title: str) -> str:
     return title.replace("Â°", "°").replace("Â°", "°")
 
 
-def format_trade(trade: dict, target_portfolio: float) -> str:
+def format_trade(trade: dict, target_portfolio: float, my_balance: float) -> str:
     ts = trade.get("timestamp", 0)
     dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     title = clean_title(trade.get("title", "Unknown Market"))
@@ -92,9 +125,9 @@ def format_trade(trade: dict, target_portfolio: float) -> str:
         f"Price: {price:.3f} | Shares: {size:.2f} | Cost: ${usdc:.2f}",
     ]
 
-    if target_portfolio > 0 and MY_BALANCE > 0:
+    if target_portfolio > 0 and my_balance > 0:
         pct = (usdc / target_portfolio) * 100 if target_portfolio else 0
-        suggested = (usdc / target_portfolio) * MY_BALANCE if target_portfolio else 0
+        suggested = (usdc / target_portfolio) * my_balance if target_portfolio else 0
         lines.append(f"Weight: {pct:.1f}% of portfolio -> *Suggested: ${suggested:.2f}*")
 
     lines.append(f"Time: {dt}")
@@ -149,27 +182,40 @@ def batch_trades(trades: list[dict]) -> list[dict]:
 
 
 def main():
-    last_ts = load_state()
-    print(f"Checking trades for @{TARGET_USERNAME} since timestamp {last_ts}")
+    state = load_state()
+    last_ts = state.get("last_timestamp", 0)
+    my_balance = state.get("my_balance", INITIAL_BALANCE)
+
+    new_balance = check_telegram_balance_updates(state)
+    if new_balance is not None:
+        old = my_balance
+        my_balance = new_balance
+        state["my_balance"] = my_balance
+        print(f"Balance updated via Telegram: ${old:.2f} -> ${my_balance:.2f}")
+        send_telegram(f"Balance updated: ${old:.2f} -> *${my_balance:.2f}*")
+
+    print(f"Checking trades for @{TARGET_USERNAME} since timestamp {last_ts} (balance: ${my_balance:.2f})")
 
     all_trades = fetch_all_activity(last_ts)
 
     if not all_trades:
         print("No new trades found.")
+        save_state(state)
         return
 
     max_ts = max(t.get("timestamp", 0) for t in all_trades)
+    state["last_timestamp"] = max_ts
 
     trades = [t for t in all_trades if matches_allowed_city(t)]
     print(f"Found {len(all_trades)} new trade(s), {len(trades)} in allowed cities")
 
     if not trades:
-        save_state(max_ts)
+        save_state(state)
         print(f"Updated last_seen timestamp to {max_ts}")
         return
 
     target_portfolio = fetch_portfolio_value(TARGET_WALLET)
-    print(f"@{TARGET_USERNAME} portfolio value: ${target_portfolio:.2f}, My balance: ${MY_BALANCE:.2f}")
+    print(f"@{TARGET_USERNAME} portfolio value: ${target_portfolio:.2f}, My balance: ${my_balance:.2f}")
 
     batched = batch_trades(trades)
 
@@ -178,21 +224,22 @@ def main():
         header = f"*@{TARGET_USERNAME}* new trade"
         if batch_count:
             header = f"*@{TARGET_USERNAME}* {batch_count} trades (batched)"
-        msg = f"{header}\n\n{format_trade(trade, target_portfolio)}"
+        msg = f"{header}\n\n{format_trade(trade, target_portfolio, my_balance)}"
         print(f"Sending alert: {trade.get('title')} {trade.get('side')}")
         send_telegram(msg)
         time.sleep(0.5)
 
-    save_state(max_ts)
+    save_state(state)
     print(f"Updated last_seen timestamp to {max_ts}")
 
 
 def send_balance_reminder():
+    state = load_state()
+    balance = state.get("my_balance", INITIAL_BALANCE)
     msg = (
         "*Daily Reminder*\n\n"
-        f"Your current configured balance is *${MY_BALANCE:.2f}*.\n"
-        "If this has changed, update the `MY_BALANCE` secret:\n"
-        "github.com/Jamesp0234/polymarket-alerts/settings/secrets/actions"
+        f"Your current balance is *${balance:.2f}*.\n"
+        "To update, just message me the new amount (e.g. `350` or `balance 350`)."
     )
     send_telegram(msg)
     print("Sent daily balance reminder")
